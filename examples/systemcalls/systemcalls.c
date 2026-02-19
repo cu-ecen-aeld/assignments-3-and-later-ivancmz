@@ -1,4 +1,10 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/wait.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,8 +22,24 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
-    return true;
+    int result = system(cmd);
+    if(result == -1)
+    {
+        int err = errno;
+        fprintf(stderr, "Error: system() failed to execute command '%s': %s\n", cmd, strerror(err));
+        return false;
+    }
+    if(cmd == NULL)
+    {
+        if(result == 0)
+        {
+            fprintf(stderr, "Error: system() no shell is available\n");
+            return false;
+        }
+        fprintf(stdout, "Info: system() shell is available\n");
+        return true;
+    }
+    return result == 0; 
 }
 
 /**
@@ -49,6 +71,8 @@ bool do_exec(int count, ...)
     // and may be removed
     command[count] = command[count];
 
+    va_end(args); // I move this line to ensure that the va_list is properly cleaned up after use
+
 /*
  * TODO:
  *   Execute a system command by calling fork, execv(),
@@ -58,10 +82,40 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    fflush(stdout); // Ensure all output is flushed before forking to avoid duplicate output in child process
+    pid_t pid = fork();
+    if(pid == -1)
+    {
+        int err = errno;
+        fprintf(stderr, "Error: fork() failed: %s\n", strerror(err));
+        return false;
+    }
+    if(pid == 0)
+    {
+        // Child process
+        execv(command[0], command);
+        int err = errno;
+        fprintf(stderr, "Error: execv() failed to execute command '%s': %s\n", command[0], strerror(err));
+        exit(1);
+    }
+    else if(pid > 0)
+    {
+        // Parent process
+        int status;
+        if (wait(&status) == -1) {
+            int err = errno;
+            fprintf(stderr, "Error: waitpid() failed: %s\n", strerror(err));
+            return false;
+        }
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status) == 0; // true if command executed successfully
+        }
+        fprintf(stderr, "Error: Command '%s' did not terminate normally\n", command[0]);
+        return false;
+    }
 
-    va_end(args);
-
-    return true;
+    fprintf(stderr, "Error: Unexpected fork() return value: %d\n", pid);
+    return false;
 }
 
 /**
@@ -84,7 +138,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     // and may be removed
     command[count] = command[count];
 
-
+    va_end(args); // I move this line to ensure that the va_list is properly cleaned up after use
 /*
  * TODO
  *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
@@ -92,8 +146,63 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+// Source - https://stackoverflow.com/a/13784315
+// Posted by tmyklebu, modified by community. See post 'Timeline' for change history
+// Retrieved 2026-02-19, License - CC BY-SA 3.0
 
-    va_end(args);
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+    if (fd < 0) 
+    { 
+        int err = errno;
+        fprintf(stderr, "Error: could not create file '%s': %s\n", outputfile, strerror(err)); 
+        return 1;
+    }
+    
+    fflush(stdout); // Ensure all output is flushed before forking to avoid duplicate output in child process
+    pid_t pid = fork();
+    if(pid == -1)
+    {
+        int err = errno;
+        fprintf(stderr, "Error: fork() failed: %s\n", strerror(err));
+        return false;
+    }
+    if(pid == 0)
+    {
+        // Child process
+        int ret = dup2(fd, 1);
+        int err = errno;
+        close(fd);
 
-    return true;
+        if (ret < 0)
+        { 
+            fprintf(stderr, "Error: dup2() failed: %s\n", strerror(err));
+            exit(1);
+        }
+
+        execv(command[0], command);
+        err = errno;
+        fprintf(stderr, "Error: execv() failed to execute command '%s': %s\n", command[0], strerror(err));
+        exit(1);
+    }
+    else if(pid > 0)
+    {
+        // Parent process
+        close(fd);
+        int status;
+        if (wait(&status) == -1) {
+            int err = errno;
+            fprintf(stderr, "Error: waitpid() failed: %s\n", strerror(err));
+            return false;
+        }
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status) == 0; // true if command executed successfully
+        }
+        fprintf(stderr, "Error: Command '%s' did not terminate normally\n", command[0]);
+        return false;
+    }
+
+    close(fd);
+    fprintf(stderr, "Error: Unexpected fork() return value: %d\n", pid);
+    return false;
+
 }
