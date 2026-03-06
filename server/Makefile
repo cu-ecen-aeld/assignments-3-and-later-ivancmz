@@ -11,7 +11,7 @@ default: $(TARGET)
 all: $(TARGET)
 
 $(TARGET): aesdsocket.c
-	$(CC) $(CFLAGS) -o $(TARGET) $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -pthread -o $(TARGET) $< $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET) *.o
