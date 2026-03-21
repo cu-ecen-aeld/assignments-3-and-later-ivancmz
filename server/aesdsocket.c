@@ -6,7 +6,6 @@
 #include <syslog.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <time.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -14,6 +13,29 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/queue.h>
+
+/*
+ * Assignment 8 – build switch USE_AESD_CHAR_DEVICE (default 1)
+ *
+ * When USE_AESD_CHAR_DEVICE == 1:
+ *   a. DATA_FILE is /dev/aesdchar instead of /var/tmp/aesdsocketdata.
+ *   b. The periodic timestamp thread is compiled out (no timestamp writes).
+ *   c. DATA_FILE is NOT removed on exit (the kernel module owns the device).
+ *   d. The file descriptor is not opened until a connection actually uses it
+ *      (already the case: we open/close per-operation in the helpers below).
+ *
+ * When USE_AESD_CHAR_DEVICE == 0 (original behaviour):
+ *   - Writes go to /var/tmp/aesdsocketdata.
+ *   - A timer thread appends a timestamp line every 10 seconds.
+ *   - The file is removed on clean exit.
+ */
+#ifdef USE_AESD_CHAR_DEVICE
+#  define DATA_FILE "/dev/aesdchar"
+#else
+#  define DATA_FILE "/var/tmp/aesdsocketdata"
+#  include <time.h>
+#  define TIMESTAMP_INTERVAL_SECS 10
+#endif
 
 /* glibc's sys/queue.h omits SLIST_FOREACH_SAFE; provide it here */
 #ifndef SLIST_FOREACH_SAFE
@@ -23,10 +45,8 @@
          (var) = (tvar))
 #endif
 
-#define PORT                    "9000"
-#define DATA_FILE               "/var/tmp/aesdsocketdata"
-#define BUF_SIZE                1024
-#define TIMESTAMP_INTERVAL_SECS 10
+#define PORT     "9000"
+#define BUF_SIZE 1024
 
 static volatile sig_atomic_t g_caught_signal = 0;
 static int                   g_sockfd        = -1;
@@ -78,6 +98,13 @@ static int setup_signals(void)
 /* Append one complete packet to DATA_FILE.  Caller must hold g_file_mutex. */
 static int append_to_file(const char *data, size_t len)
 {
+    /*
+     * With USE_AESD_CHAR_DEVICE the "file" is /dev/aesdchar.  Opening it
+     * fresh each call (O_WRONLY) means we never hold a stale fd across
+     * connections, satisfying the "do not open until accessed" requirement.
+     * The char driver ignores the write file-position, so O_APPEND vs
+     * O_WRONLY makes no functional difference there.
+     */
     FILE *fp = fopen(DATA_FILE, "a");
     if (!fp) {
         syslog(LOG_ERR, "fopen append %s: %s", DATA_FILE, strerror(errno));
@@ -91,6 +118,12 @@ static int append_to_file(const char *data, size_t len)
 /* Send entire DATA_FILE to clientfd.  Caller must hold g_file_mutex. */
 static int send_file_to_client(int clientfd)
 {
+    /*
+     * Opening the device fresh gives f_pos = 0, so the read starts from the
+     * oldest entry in the circular buffer and returns all stored commands in
+     * order.  The driver returns 0 when f_pos is past all stored data, which
+     * the fread loop treats as EOF.
+     */
     FILE *fp = fopen(DATA_FILE, "r");
     if (!fp) {
         syslog(LOG_ERR, "fopen read %s: %s", DATA_FILE, strerror(errno));
@@ -166,8 +199,14 @@ static void *connection_thread(void *arg)
     return NULL;
 }
 
-/* ── Timer thread ── */
+/* ── Timer thread (disabled when USE_AESD_CHAR_DEVICE) ── */
 
+#ifndef USE_AESD_CHAR_DEVICE
+/*
+ * Assignment 8 note: timestamp printing is removed when USE_AESD_CHAR_DEVICE
+ * is defined because the char driver maintains its own command history and
+ * interleaving timestamp lines would corrupt the expected read output.
+ */
 static void *timer_thread(void *arg)
 {
     (void)arg;
@@ -205,6 +244,7 @@ static void *timer_thread(void *arg)
 
     return NULL;
 }
+#endif /* !USE_AESD_CHAR_DEVICE */
 
 /* ── Thread reaping ── */
 
@@ -307,13 +347,19 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    /* Start timestamp timer thread (in child after daemonize) */
+    /*
+     * Start the timestamp timer thread only when NOT using the char device.
+     * With USE_AESD_CHAR_DEVICE the timer_thread symbol does not exist, so
+     * this block is excluded from compilation entirely.
+     */
+#ifndef USE_AESD_CHAR_DEVICE
     pthread_t tid_timer;
     if (pthread_create(&tid_timer, NULL, timer_thread, NULL) != 0) {
         syslog(LOG_ERR, "pthread_create timer: %s", strerror(errno));
         close(g_sockfd);
         return -1;
     }
+#endif
 
     /* Accept loop */
     while (!g_caught_signal) {
@@ -367,12 +413,20 @@ int main(int argc, char *argv[])
         free(e);
     }
 
+#ifndef USE_AESD_CHAR_DEVICE
     /* Interrupt timer thread's nanosleep, then join it */
     pthread_kill(tid_timer, SIGTERM);
     pthread_join(tid_timer, NULL);
 
-    close(g_sockfd);
+    /*
+     * Remove the data file only when using the plain filesystem path.
+     * With USE_AESD_CHAR_DEVICE the /dev/aesdchar node is owned by the
+     * kernel module and must NOT be removed here.
+     */
     remove(DATA_FILE);
+#endif
+
+    close(g_sockfd);
     closelog();
 
     return 0;
