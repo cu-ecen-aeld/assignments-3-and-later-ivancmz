@@ -7,7 +7,7 @@ LDFLAGS ?=
 # and skip deleting the endpoint on exit.
 USE_AESD_CHAR_DEVICE ?= 1
 ifeq ($(USE_AESD_CHAR_DEVICE),1)
-    CFLAGS += -DUSE_AESD_CHAR_DEVICE
+DEVICE_FLAG = -DUSE_AESD_CHAR_DEVICE
 endif
 
 TARGET = aesdsocket
@@ -18,7 +18,7 @@ default: $(TARGET)
 all: $(TARGET)
 
 $(TARGET): aesdsocket.c
-	$(CC) $(CFLAGS) -pthread -o $(TARGET) $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(DEVICE_FLAG) -pthread -o $(TARGET) $< $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET) *.o
