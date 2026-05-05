@@ -31,6 +31,8 @@
  */
 #ifdef USE_AESD_CHAR_DEVICE
 #  define DATA_FILE "/dev/aesdchar"
+#  include <sys/ioctl.h>
+#  include "../aesd-char-driver/aesd_ioctl.h"
 #else
 #  define DATA_FILE "/var/tmp/aesdsocketdata"
 #  include <time.h>
@@ -184,6 +186,46 @@ static void *connection_thread(void *arg)
     while (!g_caught_signal && (nread = getline(&line, &line_cap, stream)) > 0) {
         if (line[nread - 1] != '\n')   /* incomplete packet, drop */
             break;
+
+#ifdef USE_AESD_CHAR_DEVICE
+        /* Detect AESDCHAR_IOCSEEKTO:X,Y command – do not write it to the device */
+        if (strncmp(line, "AESDCHAR_IOCSEEKTO:", 19) == 0) {
+            unsigned int wcmd = 0, woff = 0;
+            if (sscanf(line + 19, "%u,%u", &wcmd, &woff) == 2) {
+                struct aesd_seekto seekto;
+                seekto.write_cmd        = wcmd;
+                seekto.write_cmd_offset = woff;
+
+                pthread_mutex_lock(&g_file_mutex);
+                int devfd = open(DATA_FILE, O_RDWR);
+                if (devfd >= 0) {
+                    if (ioctl(devfd, AESDCHAR_IOCSEEKTO, &seekto) == 0) {
+                        char   iobuf[BUF_SIZE];
+                        ssize_t nr;
+                        while ((nr = read(devfd, iobuf, sizeof(iobuf))) > 0) {
+                            size_t total_sent = 0;
+                            while (total_sent < (size_t)nr) {
+                                ssize_t sent = send(clientfd, iobuf + total_sent,
+                                                    (size_t)nr - total_sent, 0);
+                                if (sent == -1) {
+                                    syslog(LOG_ERR, "send (ioctl): %s", strerror(errno));
+                                    break;
+                                }
+                                total_sent += (size_t)sent;
+                            }
+                        }
+                    } else {
+                        syslog(LOG_ERR, "ioctl AESDCHAR_IOCSEEKTO: %s", strerror(errno));
+                    }
+                    close(devfd);
+                } else {
+                    syslog(LOG_ERR, "open %s for ioctl: %s", DATA_FILE, strerror(errno));
+                }
+                pthread_mutex_unlock(&g_file_mutex);
+            }
+            continue;
+        }
+#endif /* USE_AESD_CHAR_DEVICE */
 
         pthread_mutex_lock(&g_file_mutex);
         if (append_to_file(line, (size_t)nread) == 0)

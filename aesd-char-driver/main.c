@@ -21,6 +21,7 @@
 #include <linux/uaccess.h> /* copy_to_user / copy_from_user */
 #include <linux/string.h>  /* memchr */
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -213,12 +214,118 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     return retval;
 }
 
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t new_pos;
+    size_t total_size = 0;
+    uint8_t i;
+
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    /* Sum the sizes of all entries currently stored in the circular buffer */
+    if (dev->buffer.full || dev->buffer.in_offs != dev->buffer.out_offs) {
+        i = dev->buffer.out_offs;
+        do {
+            total_size += dev->buffer.entry[i].size;
+            i = (i + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        } while (i != dev->buffer.in_offs);
+    }
+
+    switch (whence) {
+    case SEEK_SET:
+        new_pos = offset;
+        break;
+    case SEEK_CUR:
+        new_pos = filp->f_pos + offset;
+        break;
+    case SEEK_END:
+        new_pos = (loff_t)total_size + offset;
+        break;
+    default:
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    if (new_pos < 0) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    filp->f_pos = new_pos;
+    mutex_unlock(&dev->lock);
+    return new_pos;
+}
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct aesd_dev   *dev = filp->private_data;
+    struct aesd_seekto seekto;
+    uint8_t  num_entries;
+    uint8_t  actual_idx;
+    loff_t   new_pos;
+    uint8_t  i;
+
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC)
+        return -ENOTTY;
+    if (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR)
+        return -ENOTTY;
+
+    switch (cmd) {
+    case AESDCHAR_IOCSEEKTO:
+        if (copy_from_user(&seekto, (struct aesd_seekto __user *)arg, sizeof(seekto)))
+            return -EFAULT;
+
+        if (mutex_lock_interruptible(&dev->lock))
+            return -ERESTARTSYS;
+
+        /* Count how many entries are currently in the buffer */
+        if (dev->buffer.full)
+            num_entries = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        else
+            num_entries = (uint8_t)((dev->buffer.in_offs - dev->buffer.out_offs +
+                           AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) %
+                           AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+
+        if (seekto.write_cmd >= num_entries) {
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }
+
+        actual_idx = (dev->buffer.out_offs + seekto.write_cmd) %
+                     AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+
+        if (seekto.write_cmd_offset >= dev->buffer.entry[actual_idx].size) {
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }
+
+        /* fpos = sum of sizes of all entries before write_cmd + write_cmd_offset */
+        new_pos = 0;
+        for (i = 0; i < seekto.write_cmd; i++) {
+            uint8_t idx = (dev->buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+            new_pos += (loff_t)dev->buffer.entry[idx].size;
+        }
+        new_pos += (loff_t)seekto.write_cmd_offset;
+
+        filp->f_pos = new_pos;
+        mutex_unlock(&dev->lock);
+        return 0;
+
+    default:
+        return -ENOTTY;
+    }
+}
+
 struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+    .owner          = THIS_MODULE,
+    .read           = aesd_read,
+    .write          = aesd_write,
+    .open           = aesd_open,
+    .release        = aesd_release,
+    .llseek         = aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
